@@ -22,6 +22,19 @@ from models.models import get_backbone_class
 
 warnings.filterwarnings("ignore", category=sklearn.exceptions.UndefinedMetricWarning)
 
+def count_parameters(model, verbose=True):
+    total = sum(p.numel() for p in model.parameters())
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen = total - trainable
+
+    if verbose:
+        print(f"{'='*50}")
+        print(f"Total params     : {total:>15,}  ({total/1e6:.2f} M)")
+        print(f"Trainable params : {trainable:>15,}  ({trainable/1e6:.2f} M)")
+        print(f"Frozen params    : {frozen:>15,}  ({frozen/1e6:.2f} M)")
+        print(f"{'='*50}")
+    return total, trainable
+
 class AbstractTrainer(object):
     """
    This class contain the main training functions for our AdAtime
@@ -80,6 +93,7 @@ class AbstractTrainer(object):
 
         # Initilaize the algorithm
         self.algorithm = algorithm_class(backbone_fe, self.dataset_configs, self.hparams, self.device)
+        count_parameters(self.algorithm)
         self.algorithm.to(self.device)
 
     def load_checkpoint(self, model_dir):
@@ -285,4 +299,14 @@ class AbstractTrainer(object):
         # Apply the formatting function to each element in the tables
         table = table.applymap(format_func)
 
-        return table 
+        return table
+
+    def calculate_metrics_for_loader(self, loader):
+        self.evaluate(loader)
+        # accuracy
+        acc = self.ACC(self.full_preds.argmax(dim=1).cpu(), self.full_labels.cpu()).item()
+        # f1
+        f1 = self.F1(self.full_preds.argmax(dim=1).cpu(), self.full_labels.cpu()).item()
+        # auroc
+        auroc = self.AUROC(self.full_preds.cpu(), self.full_labels.cpu()).item()
+        return acc, f1, auroc

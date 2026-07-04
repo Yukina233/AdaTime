@@ -45,6 +45,20 @@ class HAR():
                 "src_cls_loss_wt": 5.1390077646202,
                 "weight_decay": 0.0001
             },
+            "DANN_DC": {
+                "domain_loss_wt": 2.943729820531079,
+                "learning_rate": 0.001,
+                "src_cls_loss_wt": 5.1390077646202,
+                "weight_decay": 0.0001
+            },
+            "DANN_CL": {
+                "domain_loss_wt": 0,
+                "learning_rate": 0.001,
+                "src_cls_loss_wt": 5.1390077646202,
+                "weight_decay": 0.0001,
+                "contrastive_margin": 0.5,
+                "contrastive_loss_wt": 2
+            },
             "DIRT": {
                 "cond_ent_wt": 1.20721518968644,
                 "domain_loss_wt": 1.9012145515129044,
@@ -98,7 +112,15 @@ class HAR():
                        'src_cls_weight': 0.78, 'src_supCon_weight': 0.1, 'trg_cont_weight': 0.1,
                        'trg_entropy_weight': 0.05},
             'MCD': {'learning_rate': 1e-2, 'src_cls_loss_wt': 9.74, 'domain_loss_wt': 5.43},
-
+            'NO_ADAPT_WITH_AE': {'learning_rate': 1e-3, 'lambda_reconstruct': 0.5},
+            "ADDA": {
+                "pre_learning_rate": 1e-2,
+                "learning_rate": 1e-5,
+                "src_weight_decay": 1e-4,
+                "weight_decay": 1e-4,
+                "pretrain_epochs": 20,  # 建议占总 num_epochs 的 30%~50%
+                "disc_hid_dim": 500,
+            },
         }
 
 
@@ -109,7 +131,8 @@ class EEG():
             'num_epochs': 40,
             'batch_size': 128,
             'weight_decay': 1e-4,
-
+            'step_size': 50,
+            'lr_decay': 0.5
         }
         self.alg_hparams = {
             'NO_ADAPT': {'learning_rate': 1e-3, 'src_cls_loss_wt': 1},
@@ -190,7 +213,17 @@ class EEG():
             },
             'CoTMix': {'learning_rate': 0.001, 'mix_ratio': 0.79, 'temporal_shift': 300,
                        'src_cls_weight': 0.96, 'src_supCon_weight': 0.1, 'trg_cont_weight': 0.1,
-                       'trg_entropy_weight': 0.05}
+                       'trg_entropy_weight': 0.05},
+            "ADDA": {
+                "pre_learning_rate": 1e-3,
+                "learning_rate": 2e-4,
+                "src_weight_decay": 1e-4,
+                "weight_decay": 1e-4,
+                "pretrain_epochs": 20,  # 建议占总 num_epochs 的 30%~50%
+                "disc_hid_dim": 500,
+                "src_cls_loss_wt": 1.0,  # 占位，不一定用到
+                "domain_loss_wt": 1.0,  # 占位
+            },
 
         }
 
@@ -202,7 +235,8 @@ class WISDM():
             'num_epochs': 40,
             'batch_size': 32,
             'weight_decay': 1e-4,
-
+            'step_size': 50,
+            'lr_decay': 0.5
         }
         self.alg_hparams = {
             'NO_ADAPT': {'learning_rate': 1e-3, 'src_cls_loss_wt': 1},
@@ -288,7 +322,18 @@ class WISDM():
                 'src_cls_weight': 0.98, 
                 'src_supCon_weight': 0.1, 
                 'trg_cont_weight': 0.1,
-                'trg_entropy_weight': 0.05}
+                'trg_entropy_weight': 0.05
+            },
+            "ADDA": {
+                "pre_learning_rate": 1e-3,
+                "learning_rate": 2e-4,
+                "src_weight_decay": 1e-4,
+                "weight_decay": 1e-4,
+                "pretrain_epochs": 20,  # 建议占总 num_epochs 的 30%~50%
+                "disc_hid_dim": 500,
+                "src_cls_loss_wt": 1.0,  # 占位，不一定用到
+                "domain_loss_wt": 1.0,  # 占位
+            },
         }
 
 
@@ -299,6 +344,8 @@ class HHAR():
             'num_epochs': 40,
             'batch_size': 32,
             'weight_decay': 1e-4,
+            'step_size': 50,
+            'lr_decay': 0.5
         }
         self.alg_hparams = {
             'NO_ADAPT': {'learning_rate': 1e-3, 'src_cls_loss_wt': 1},
@@ -364,6 +411,14 @@ class HHAR():
                 "src_cls_loss_wt": 2.038458138479581,
                 "weight_decay": 0.0001
             },
+            "DANN_CL": {
+                "domain_loss_wt": 1.0296390274908802,
+                "learning_rate": 0.0005,
+                "src_cls_loss_wt": 2.038458138479581,
+                "weight_decay": 0.0001,
+                "contrastive_margin": 0.5,
+                "contrastive_loss_wt": 1
+            },
             "Deep_Coral": {
                 "coral_wt": 5.9357031653707475,
                 "learning_rate": 0.0005,
@@ -380,7 +435,17 @@ class HHAR():
             },
             'CoTMix': {'learning_rate': 0.001, 'mix_ratio': 0.52, 'temporal_shift': 14,
                        'src_cls_weight': 0.8, 'src_supCon_weight': 0.1, 'trg_cont_weight': 0.1,
-                       'trg_entropy_weight': 0.05}
+                       'trg_entropy_weight': 0.05},
+            "ADDA": {
+                "pre_learning_rate": 1e-3,
+                "learning_rate": 2e-4,
+                "src_weight_decay": 1e-4,
+                "weight_decay": 1e-4,
+                "pretrain_epochs": 20,  # 建议占总 num_epochs 的 30%~50%
+                "disc_hid_dim": 500,
+                "src_cls_loss_wt": 1.0,  # 占位，不一定用到
+                "domain_loss_wt": 1.0,  # 占位
+            },
 
         }
 
@@ -392,6 +457,8 @@ class FD():
             'num_epochs': 40,
             'batch_size': 32,
             'weight_decay': 1e-4,
+            'step_size': 50,
+            'lr_decay': 0.5
         }
         self.alg_hparams = {
             'NO_ADAPT': {'learning_rate': 1e-3, 'src_cls_loss_wt': 1},
@@ -472,5 +539,15 @@ class FD():
             },
             'CoTMix': {'learning_rate': 0.001, 'mix_ratio': 0.52, 'temporal_shift': 14,
                        'src_cls_weight': 0.8, 'src_supCon_weight': 0.1, 'trg_cont_weight': 0.1,
-                       'trg_entropy_weight': 0.05}
+                       'trg_entropy_weight': 0.05},
+            "ADDA": {
+                "pre_learning_rate": 1e-3,
+                "learning_rate": 2e-4,
+                "src_weight_decay": 1e-4,
+                "weight_decay": 1e-4,
+                "pretrain_epochs": 80,  # 建议占总 num_epochs 的 30%~50%
+                "disc_hid_dim": 500,
+                "src_cls_loss_wt": 1.0,  # 占位，不一定用到
+                "domain_loss_wt": 1.0,  # 占位
+            },
         }

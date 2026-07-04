@@ -24,7 +24,8 @@ class HAR():
         # CNN and RESNET features
         self.mid_channels = 64
         self.final_out_channels = 128
-        self.features_len = 1
+        self.features_len = 9
+        self.decoder_input_len = 18  # 解码器的输入长度（与原始输入匹配）
 
         # TCN features
         self.tcn_layers = [75, 150]
@@ -186,7 +187,7 @@ class FD(object):
 
         self.mid_channels = 64
         self.final_out_channels = 128
-        self.features_len = 1
+        self.features_len = 9
 
         # TCN features
         self.tcn_layers = [75, 150]

@@ -6,6 +6,8 @@ from torch.nn.utils import weight_norm
 import torch.nn.functional as F
 from .resnet18 import resnet18
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 # from utils import weights_init
 
@@ -61,6 +63,47 @@ class CNN(nn.Module):
         return x_flat
 
 
+class CNN_Decoder(nn.Module):
+    def __init__(self, configs):
+        super(CNN_Decoder, self).__init__()
+
+        # 反向过程：逐步还原输入
+        self.adaptive_unpool = nn.AdaptiveAvgPool1d(configs.decoder_input_len)
+
+        self.deconv_block3 = nn.Sequential(
+            nn.ConvTranspose1d(configs.final_out_channels, configs.mid_channels * 2, kernel_size=8, stride=1,
+                               padding=4, bias=False),
+            nn.BatchNorm1d(configs.mid_channels * 2),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='linear', align_corners=True),  # 对应 MaxPool1d
+        )
+
+        self.deconv_block2 = nn.Sequential(
+            nn.ConvTranspose1d(configs.mid_channels * 2, configs.mid_channels, kernel_size=8, stride=1,
+                               padding=4, bias=False),
+            nn.BatchNorm1d(configs.mid_channels),
+            nn.ReLU(),
+            nn.Upsample(scale_factor=2, mode='linear', align_corners=True),  # 对应 MaxPool1d
+        )
+
+        self.deconv_block1 = nn.Sequential(
+            nn.ConvTranspose1d(configs.mid_channels, configs.input_channels, kernel_size=configs.kernel_size,
+                               stride=configs.stride, padding=(configs.kernel_size // 2), bias=False),
+            nn.BatchNorm1d(configs.input_channels),
+            nn.ReLU(),
+            nn.Upsample(size=128, mode='linear', align_corners=True)  # 强制调整到输入长度
+        )
+
+    def forward(self, x_in):
+        # 解码过程
+        # 增加一个维度
+        x = x_in.reshape(x_in.shape[0], 128, -1) # 中间是通道数
+        x = self.adaptive_unpool(x)
+        x = self.deconv_block3(x)
+        x = self.deconv_block2(x)
+        x = self.deconv_block1(x)
+
+        return x
 
 class classifier(nn.Module):
     def __init__(self, configs):

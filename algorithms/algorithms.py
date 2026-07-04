@@ -1,10 +1,10 @@
 import torch
 import torch.nn as nn
 import numpy as np
-import itertools    
+import itertools
 
 from models.models import classifier, ReverseLayerF, Discriminator, RandomLayer, Discriminator_CDAN, \
-    codats_classifier, AdvSKM_Disc, CNN_ATTN
+    codats_classifier, AdvSKM_Disc, CNN_ATTN, CNN_Decoder
 from models.loss import MMD_loss, CORAL, ConditionalEntropyLoss, VAT, LMMD_loss, HoMM_loss, NTXentLoss, SupConLoss
 from utils import EMA
 from torch.optim.lr_scheduler import StepLR
@@ -41,7 +41,8 @@ class Algorithm(torch.nn.Module):
         best_model = None
 
         for epoch in range(1, self.hparams["num_epochs"] + 1):
-            
+            if hasattr(self, "current_epoch"):
+                self.current_epoch = epoch - 1
             # training loop 
             self.training_epoch(src_loader, trg_loader, avg_meter, epoch)
 
@@ -55,15 +56,38 @@ class Algorithm(torch.nn.Module):
             for key, val in avg_meter.items():
                 logger.debug(f'{key}\t: {val.avg:2.4f}')
             logger.debug(f'-------------------------------------')
-        
+
         last_model = self.network.state_dict()
 
         return last_model, best_model
-    
+
     # train loop vary from one method to another
     def training_epoch(self, *args, **kwargs):
         raise NotImplementedError
-       
+
+def contrastive_loss(features, labels, margin=1.0):
+    """
+    Contrastive loss for feature regularization.
+    Args:
+        features: Tensor, shape [N, D], feature representations.
+        labels: Tensor, shape [N], ground truth labels.
+        margin: float, margin for contrastive loss.
+    Returns:
+        loss: Scalar tensor, the contrastive loss.
+    """
+    pairwise_dist = torch.cdist(features, features, p=2)  # Pairwise Euclidean distance, shape [N, N]
+    labels = labels.unsqueeze(1)  # Shape [N, 1]
+    pairwise_labels = (labels == labels.T).float()  # Shape [N, N], 1 for positive pairs, 0 for negative pairs
+
+    # Positive pairs loss
+    positive_loss = pairwise_labels * pairwise_dist**2
+
+    # Negative pairs loss
+    negative_loss = (1 - pairwise_labels) * F.relu(margin - pairwise_dist)**2
+
+    # Combine losses
+    loss = (positive_loss + negative_loss).mean()
+    return loss
 
 class NO_ADAPT(Algorithm):
     """
@@ -86,7 +110,7 @@ class NO_ADAPT(Algorithm):
 
     def training_epoch(self,src_loader, trg_loader, avg_meter, epoch):
         for src_x, src_y in src_loader:
-            
+
             src_x, src_y = src_x.to(self.device), src_y.to(self.device)
             src_feat = self.feature_extractor(src_x)
             src_pred = self.classifier(src_feat)
@@ -105,7 +129,7 @@ class NO_ADAPT(Algorithm):
                 avg_meter[key].update(val, 32)
 
         self.lr_scheduler.step()
-    
+
 
 class TARGET_ONLY(Algorithm):
     """
@@ -274,7 +298,7 @@ class MMDA(Algorithm):
 
             losses =  {'Total_loss': loss.item(), 'Coral_loss': coral_loss.item(), 'MMD_loss': mmd_loss.item(),
                     'cond_ent_wt': cond_ent_loss.item(), 'Src_cls_loss': src_cls_loss.item()}
-            
+
             for key, val in losses.items():
                 avg_meter[key].update(val, 32)
 
@@ -289,7 +313,7 @@ class DANN(Algorithm):
     def __init__(self, backbone, configs, hparams, device):
         super().__init__(configs, backbone)
 
-        
+
         # optimizer and scheduler
         self.optimizer = torch.optim.Adam(
             self.network.parameters(),
@@ -323,7 +347,7 @@ class DANN(Algorithm):
         for step, ((src_x, src_y), (trg_x, _)) in joint_loader:
 
             src_x, src_y, trg_x = src_x.to(self.device), src_y.to(self.device), trg_x.to(self.device)
-            
+
             p = float(step + epoch * num_batches) / self.hparams["num_epochs"] + 1 / num_batches
             alpha = 2. / (1. + np.exp(-10 * p)) - 1
 
@@ -364,7 +388,198 @@ class DANN(Algorithm):
             self.optimizer_disc.step()
 
             losses =  {'Total_loss': loss.item(), 'Domain_loss': domain_loss.item(), 'Src_cls_loss': src_cls_loss.item()}
-           
+
+            for key, val in losses.items():
+                avg_meter[key].update(val, 32)
+
+        self.lr_scheduler.step()
+
+class DANN_DC(Algorithm):
+    """
+    DANN_DC: DANN with distance constraints https://arxiv.org/abs/1505.07818
+    """
+
+    def __init__(self, backbone, configs, hparams, device):
+        super().__init__(configs, backbone)
+
+
+        # optimizer and scheduler
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"]
+        )
+        self.lr_scheduler = StepLR(self.optimizer, step_size=hparams['step_size'], gamma=hparams['lr_decay'])
+        # hparams
+        self.hparams = hparams
+        # device
+        self.device = device
+
+        # Domain Discriminator
+        self.domain_classifier = Discriminator(configs)
+        self.optimizer_disc = torch.optim.Adam(
+            self.domain_classifier.parameters(),
+            lr=hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"], betas=(0.5, 0.99)
+        )
+
+    def training_epoch(self,src_loader, trg_loader, avg_meter, epoch):
+        # Combine dataloaders
+        # Method 1 (min len of both domains)
+        # joint_loader = enumerate(zip(src_loader, trg_loader))
+
+        # Method 2 (max len of both domains)
+        # joint_loader =enumerate(zip(src_loader, itertools.cycle(trg_loader)))
+        joint_loader =enumerate(zip(src_loader, itertools.cycle(trg_loader)))
+        num_batches = max(len(src_loader), len(trg_loader))
+
+        for step, ((src_x, src_y), (trg_x, _)) in joint_loader:
+
+            src_x, src_y, trg_x = src_x.to(self.device), src_y.to(self.device), trg_x.to(self.device)
+
+            p = float(step + epoch * num_batches) / self.hparams["num_epochs"] + 1 / num_batches
+            alpha = 2. / (1. + np.exp(-10 * p)) - 1
+
+            # zero grad
+            self.optimizer.zero_grad()
+            self.optimizer_disc.zero_grad()
+
+            domain_label_src = torch.ones(len(src_x)).to(self.device)
+            domain_label_trg = torch.zeros(len(trg_x)).to(self.device)
+
+            src_feat = self.feature_extractor(src_x)
+            src_pred = self.classifier(src_feat)
+
+            trg_feat = self.feature_extractor(trg_x)
+
+            # Task classification  Loss
+            src_cls_loss = self.cross_entropy(src_pred.squeeze(), src_y)
+
+
+            # Domain classification loss
+            # source
+            src_feat_reversed = ReverseLayerF.apply(src_feat, alpha)
+            src_domain_pred = self.domain_classifier(src_feat_reversed)
+            src_domain_loss = self.cross_entropy(src_domain_pred, domain_label_src.long())
+
+            # target
+            trg_feat_reversed = ReverseLayerF.apply(trg_feat, alpha)
+            trg_domain_pred = self.domain_classifier(trg_feat_reversed)
+            trg_domain_loss = self.cross_entropy(trg_domain_pred, domain_label_trg.long())
+
+            # Total domain loss
+            domain_loss = src_domain_loss + trg_domain_loss
+
+            loss = self.hparams["src_cls_loss_wt"] * src_cls_loss + \
+                self.hparams["domain_loss_wt"] * domain_loss
+
+            loss.backward()
+            self.optimizer.step()
+            self.optimizer_disc.step()
+
+            losses =  {'Total_loss': loss.item(), 'Domain_loss': domain_loss.item(), 'Src_cls_loss': src_cls_loss.item()}
+
+            for key, val in losses.items():
+                avg_meter[key].update(val, 32)
+
+        self.lr_scheduler.step()
+
+class DANN_CL(Algorithm):
+    """
+    DANN_CL: DANN with Contrastive Learning https://arxiv.org/abs/1505.07818
+    """
+
+    def __init__(self, backbone, configs, hparams, device):
+        super().__init__(configs, backbone)
+
+
+        # optimizer and scheduler
+        self.optimizer = torch.optim.Adam(
+            self.network.parameters(),
+            lr=hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"]
+        )
+        self.lr_scheduler = StepLR(self.optimizer, step_size=hparams['step_size'], gamma=hparams['lr_decay'])
+        # hparams
+        self.hparams = hparams
+        # device
+        self.device = device
+
+        # Domain Discriminator
+        self.domain_classifier = Discriminator(configs)
+        self.optimizer_disc = torch.optim.Adam(
+            self.domain_classifier.parameters(),
+            lr=hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"], betas=(0.5, 0.99)
+        )
+
+    def training_epoch(self,src_loader, trg_loader, avg_meter, epoch):
+        # Combine dataloaders
+        # Method 1 (min len of both domains)
+        # joint_loader = enumerate(zip(src_loader, trg_loader))
+
+        # Method 2 (max len of both domains)
+        # joint_loader =enumerate(zip(src_loader, itertools.cycle(trg_loader)))
+        joint_loader =enumerate(zip(src_loader, itertools.cycle(trg_loader)))
+        num_batches = max(len(src_loader), len(trg_loader))
+
+        for step, ((src_x, src_y), (trg_x, _)) in joint_loader:
+
+            src_x, src_y, trg_x = src_x.to(self.device), src_y.to(self.device), trg_x.to(self.device)
+
+            p = float(step + epoch * num_batches) / self.hparams["num_epochs"] + 1 / num_batches
+            alpha = 2. / (1. + np.exp(-10 * p)) - 1
+
+            # zero grad
+            self.optimizer.zero_grad()
+            self.optimizer_disc.zero_grad()
+
+            domain_label_src = torch.ones(len(src_x)).to(self.device)
+            domain_label_trg = torch.zeros(len(trg_x)).to(self.device)
+
+            src_feat = self.feature_extractor(src_x)
+            src_pred = self.classifier(src_feat)
+
+            trg_feat = self.feature_extractor(trg_x)
+
+            # Task classification loss
+            src_cls_loss = self.cross_entropy(src_pred.squeeze(), src_y)
+
+            # Contrastive loss for source features
+            contrastive_loss_src = contrastive_loss(src_feat, src_y, margin=self.hparams["contrastive_margin"])
+
+            # Combine classification loss and contrastive loss
+            task_loss = self.hparams["src_cls_loss_wt"] * src_cls_loss + \
+                        self.hparams["contrastive_loss_wt"] * contrastive_loss_src
+
+            # Domain classification loss
+            # source
+            src_feat_reversed = ReverseLayerF.apply(src_feat, alpha)
+            src_domain_pred = self.domain_classifier(src_feat_reversed)
+            src_domain_loss = self.cross_entropy(src_domain_pred, domain_label_src.long())
+
+            # target
+            trg_feat_reversed = ReverseLayerF.apply(trg_feat, alpha)
+            trg_domain_pred = self.domain_classifier(trg_feat_reversed)
+            trg_domain_loss = self.cross_entropy(trg_domain_pred, domain_label_trg.long())
+
+            # Total domain loss
+            domain_loss = src_domain_loss + trg_domain_loss
+
+            # Total loss
+            loss = task_loss + self.hparams["domain_loss_wt"] * domain_loss
+
+            loss.backward()
+            self.optimizer.step()
+            self.optimizer_disc.step()
+
+            losses = {
+                'Total_loss': loss.item(),
+                'Domain_loss': domain_loss.item(),
+                'Src_cls_loss': src_cls_loss.item(),
+                'Contrastive_loss': contrastive_loss_src.item()
+            }
+
             for key, val in losses.items():
                 avg_meter[key].update(val, 32)
 
@@ -504,7 +719,7 @@ class DIRT(Algorithm):
             lr=hparams["learning_rate"],
             weight_decay=hparams["weight_decay"]
         )
-       
+
     def training_epoch(self,src_loader, trg_loader, avg_meter, epoch):
 
         # Construct Joint Loaders 
@@ -666,7 +881,7 @@ class HoMM(Algorithm):
 
         for step, ((src_x, src_y), (trg_x, _)) in joint_loader:
             src_x, src_y, trg_x = src_x.to(self.device), src_y.to(self.device), trg_x.to(self.device)           # extract source features
-            
+
             src_feat = self.feature_extractor(src_x)
             src_pred = self.classifier(src_feat)
 
@@ -689,7 +904,7 @@ class HoMM(Algorithm):
             self.optimizer.step()
 
             losses =  {'Total_loss': loss.item(), 'HoMM_loss': domain_loss.item(), 'Src_cls_loss': src_cls_loss.item()}
-            
+
             for key, val in losses.items():
                 avg_meter[key].update(val, 32)
 
@@ -721,7 +936,7 @@ class DDC(Algorithm):
 
     def training_epoch(self, src_loader, trg_loader, avg_meter, epoch):
 
-        # Construct Joint Loaders 
+        # Construct Joint Loaders
         joint_loader =enumerate(zip(src_loader, itertools.cycle(trg_loader)))
 
         for step, ((src_x, src_y), (trg_x, _)) in joint_loader:
@@ -796,7 +1011,7 @@ class CoDATS(Algorithm):
         num_batches = max(len(src_loader), len(trg_loader))
         for step, ((src_x, src_y), (trg_x, _)) in joint_loader:
             src_x, src_y, trg_x = src_x.to(self.device), src_y.to(self.device), trg_x.to(self.device)           # extract source features
-        
+
             p = float(step + epoch * num_batches) / self.hparams["num_epochs"] + 1 / num_batches
             alpha = 2. / (1. + np.exp(-10 * p)) - 1
 
@@ -877,7 +1092,7 @@ class AdvSKM(Algorithm):
         joint_loader =enumerate(zip(src_loader, itertools.cycle(trg_loader)))
         for step, ((src_x, src_y), (trg_x, _)) in joint_loader:
             src_x, src_y, trg_x = src_x.to(self.device), src_y.to(self.device), trg_x.to(self.device)         # extract source features
-            
+
             src_feat = self.feature_extractor(src_x)
             src_pred = self.classifier(src_feat)
 
@@ -920,7 +1135,7 @@ class AdvSKM(Algorithm):
         self.lr_scheduler.step()
 
 class SASA(Algorithm):
-    
+
     def __init__(self, backbone, configs, hparams, device):
         super().__init__(configs, backbone)
 
@@ -1067,10 +1282,10 @@ class CoTMix(Algorithm):
             for key, val in losses.items():
                 avg_meter[key].update(val, 32)
 
-        self.lr_scheduler.step()           
+        self.lr_scheduler.step()
 
     def temporal_mixup(self,src_x, trg_x):
-        
+
         mix_ratio = round(self.hparams["mix_ratio"], 2)
         temporal_shift = self.hparams["temporal_shift"]
         h = temporal_shift // 2  # half
@@ -1080,9 +1295,9 @@ class CoTMix(Algorithm):
 
         trg_dominant = mix_ratio * trg_x + (1 - mix_ratio) * \
                     torch.mean(torch.stack([torch.roll(src_x, -i, 2) for i in range(-h, h)], 2), 2)
-        
+
         return src_dominant, trg_dominant
-    
+
 
 
 # Untied Approaches: (MCD)
@@ -1139,7 +1354,7 @@ class MCD(Algorithm):
         best_model = None
 
         for epoch in range(1, self.hparams["num_epochs"] + 1):
-            
+
             # source pretraining loop 
             self.pretrain_epoch(src_loader, avg_meter)
 
@@ -1156,7 +1371,7 @@ class MCD(Algorithm):
             for key, val in avg_meter.items():
                 logger.debug(f'{key}\t: {val.avg:2.4f}')
             logger.debug(f'-------------------------------------')
-        
+
         last_model = self.network.state_dict()
 
         return last_model, best_model
@@ -1164,7 +1379,7 @@ class MCD(Algorithm):
     def pretrain_epoch(self, src_loader,avg_meter):
         for src_x, src_y in src_loader:
             src_x, src_y = src_x.to(self.device), src_y.to(self.device)
-          
+
             src_feat = self.feature_extractor(src_x)
             src_pred1 = self.classifier(src_feat)
             src_pred2 = self.classifier2(src_feat)
@@ -1184,7 +1399,7 @@ class MCD(Algorithm):
             self.optimizer_c2.step()
             self.optimizer_fe.step()
 
-            
+
             losses = {'Src_cls_loss': loss.item()}
 
             for key, val in losses.items():
@@ -1197,7 +1412,7 @@ class MCD(Algorithm):
 
         for step, ((src_x, src_y), (trg_x, _)) in joint_loader:
             src_x, src_y, trg_x = src_x.to(self.device), src_y.to(self.device), trg_x.to(self.device)           # extract source features
-            
+
 
             # extract source features
             src_feat = self.feature_extractor(src_x)
@@ -1208,13 +1423,13 @@ class MCD(Algorithm):
             src_cls_loss1 = self.cross_entropy(src_pred1, src_y)
             src_cls_loss2 = self.cross_entropy(src_pred2, src_y)
             loss_s = src_cls_loss1 + src_cls_loss2
-            
+
 
             # Freeze the feature extractor
             for k, v in self.feature_extractor.named_parameters():
                 v.requires_grad = False
             # update C1 and C2 to maximize their difference on target sample
-            trg_feat = self.feature_extractor(trg_x) 
+            trg_feat = self.feature_extractor(trg_x)
             trg_pred1 = self.classifier(trg_feat.detach())
             trg_pred2 = self.classifier2(trg_feat.detach())
 
@@ -1222,7 +1437,7 @@ class MCD(Algorithm):
             loss_dis = self.discrepancy(trg_pred1, trg_pred2)
 
             loss = loss_s - loss_dis
-            
+
             loss.backward()
             self.optimizer_c1.step()
             self.optimizer_c2.step()
@@ -1240,13 +1455,13 @@ class MCD(Algorithm):
             for k, v in self.feature_extractor.named_parameters():
                 v.requires_grad = True
             # update feature extractor to minimize the discrepaqncy on target samples
-            trg_feat = self.feature_extractor(trg_x)        
+            trg_feat = self.feature_extractor(trg_x)
             trg_pred1 = self.classifier(trg_feat)
             trg_pred2 = self.classifier2(trg_feat)
 
 
             loss_dis_t = self.discrepancy(trg_pred1, trg_pred2)
-            domain_loss = self.hparams["domain_loss_wt"] * loss_dis_t 
+            domain_loss = self.hparams["domain_loss_wt"] * loss_dis_t
 
             domain_loss.backward()
             self.optimizer_fe.step()
@@ -1268,3 +1483,270 @@ class MCD(Algorithm):
     def discrepancy(self, out1, out2):
 
         return torch.mean(torch.abs(F.softmax(out1) - F.softmax(out2)))
+
+
+class NO_ADAPT_WITH_AE(Algorithm):
+    """
+    Lower bound: train on source and test on target.
+    With an autoencoder to add reconstruction losses for both src_x and trg_x.
+    """
+    def __init__(self, backbone, configs, hparams, device):
+        super().__init__(configs, backbone)
+
+        # Define the decoder (inverse of feature_extractor)
+
+        encoder_name = str(type(self.feature_extractor)).split('.')[-1][:-2]
+        self.decoder = globals()[encoder_name + '_Decoder'](configs)
+
+        # Update the network to include both feature extractor and decoder
+        self.autoencoder = nn.Sequential(self.feature_extractor, self.decoder)
+
+        # Optimizer and scheduler
+        self.optimizer = torch.optim.Adam(
+            list(self.network.parameters()) + list(self.decoder.parameters()),
+            lr=hparams["learning_rate"],
+            weight_decay=hparams["weight_decay"]
+        )
+        self.lr_scheduler = StepLR(self.optimizer, step_size=hparams['step_size'], gamma=hparams['lr_decay'])
+
+        # Hyperparameters
+        self.hparams = hparams
+
+        # Device
+        self.device = device
+
+        # Reconstruction loss (Mean Squared Error for autoencoder)
+        self.reconstruction_loss = nn.MSELoss()
+
+    def training_epoch(self, src_loader, trg_loader, avg_meter, epoch):
+        # Set the model to training mode
+        self.train()
+
+        # Iterate through both source and target data loaders
+        for (src_x, src_y), (trg_x, _) in zip(src_loader, trg_loader):
+            # Move data to the appropriate device
+            src_x, src_y = src_x.to(self.device), src_y.to(self.device)
+            trg_x = trg_x.to(self.device)
+
+            # Forward pass for the source domain
+            src_feat = self.feature_extractor(src_x)
+            src_pred = self.classifier(src_feat)
+            src_reconstructed = self.decoder(src_feat)
+
+            # Forward pass for the target domain
+            trg_feat = self.feature_extractor(trg_x)
+            trg_reconstructed = self.decoder(trg_feat)
+
+            # Compute classification loss for the source domain
+            src_cls_loss = self.cross_entropy(src_pred, src_y)
+
+            # Compute reconstruction loss for both source and target
+            src_reconstruction_loss = self.reconstruction_loss(src_reconstructed, src_x)
+            trg_reconstruction_loss = self.reconstruction_loss(trg_reconstructed, trg_x)
+
+            # Total loss is the sum of classification and reconstruction losses
+            loss = ((1 - self.hparams["lambda_reconstruct"]) * src_cls_loss
+                    + self.hparams["lambda_reconstruct"] * (src_reconstruction_loss + trg_reconstruction_loss))
+
+            # Backpropagation and optimization
+            self.optimizer.zero_grad()
+            loss.backward()
+            self.optimizer.step()
+
+            # Log losses
+            losses = {
+                'Src_cls_loss': src_cls_loss.item(),
+                'Src_reconstruct_loss': src_reconstruction_loss.item(),
+                'Trg_reconstruct_loss': trg_reconstruction_loss.item(),
+            }
+
+            for key, val in losses.items():
+                avg_meter[key].update(val, src_x.size(0))
+
+        # Step the learning rate scheduler
+        self.lr_scheduler.step()
+
+class ADDA_Discriminator(nn.Module):
+    """ADDA 用的域判别器，输入为 encoder 提取的特征"""
+    def __init__(self, configs, hparams):
+        super().__init__()
+        input_dim = configs.features_len * configs.final_out_channels
+        hidden_dim = hparams.get("disc_hid_dim", 500)
+        self.layer = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 2)   # 2 类：源域/目标域
+        )
+
+    def forward(self, x):
+        return self.layer(x.flatten(1))
+
+
+class ADDA(Algorithm):
+    """
+    Adversarial Discriminative Domain Adaptation (Tzeng et al., 2017)
+    适配到 AdaTime 框架的时序版本
+    两阶段：
+      1) 0 ~ pretrain_epochs:        监督训练 src_encoder + classifier
+      2) pretrain_epochs ~ num_epochs: 冻结 src_encoder/classifier，
+                                       对抗训练 tgt_encoder vs discriminator
+    推理时使用 tgt_encoder + classifier
+    """
+    def __init__(self, backbone, configs, hparams, device):
+        # 父类会创建 self.feature_extractor / self.classifier / self.network
+        super().__init__(configs, backbone)
+
+        self.device = device
+        self.hparams = hparams
+
+        # 复用父类创建的 feature_extractor 作为 src_encoder
+        self.src_encoder = self.feature_extractor
+
+        # 目标域 encoder（结构同 src_encoder，权重在 adapt 阶段从 src_encoder 拷贝）
+        self.tgt_encoder = backbone(configs)
+
+        # 域判别器
+        self.discriminator = ADDA_Discriminator(configs, hparams).to(device)
+
+        # ----- 优化器 -----
+        # 阶段1：源域分类
+        self.src_optimizer = torch.optim.Adam(
+            list(self.src_encoder.parameters()) + list(self.classifier.parameters()),
+            lr=hparams["pre_learning_rate"],
+            weight_decay=hparams["src_weight_decay"]
+        )
+        # 阶段2：tgt encoder（对抗）
+        self.tgt_optimizer = torch.optim.Adam(
+            self.tgt_encoder.parameters(),
+            lr=hparams["learning_rate"],
+            betas=(0.5, 0.9),
+            weight_decay=hparams["weight_decay"]
+        )
+        # 阶段2：discriminator
+        self.disc_optimizer = torch.optim.Adam(
+            self.discriminator.parameters(),
+            lr=hparams["learning_rate"],
+            betas=(0.5, 0.9),
+            weight_decay=hparams["weight_decay"]
+        )
+
+        # 阶段1 lr 调度
+        self.lr_scheduler = StepLR(self.src_optimizer,
+                                   step_size=hparams['step_size'],
+                                   gamma=hparams['lr_decay'])
+
+        # 损失
+        self.cls_criterion = nn.CrossEntropyLoss()
+        self.adv_criterion = nn.CrossEntropyLoss()
+
+        # 阶段控制
+        self.pretrain_epochs = hparams["pretrain_epochs"]
+        self.current_epoch = 0
+        self.is_pretrained = False
+
+    # ===================================================================
+    # AdaTime 的入口：按 epoch 调用
+    # ===================================================================
+    def training_epoch(self, src_loader, trg_loader, avg_meter, epoch):
+        # 基类 update 里会设置 self.current_epoch = epoch - 1
+        if self.current_epoch < self.pretrain_epochs:
+            self._pretrain_epoch(src_loader, avg_meter)
+            self.lr_scheduler.step()
+        else:
+            # 第一次进入 adapt 阶段时，把 src_encoder 权重拷给 tgt_encoder
+            if not self.is_pretrained:
+                self.tgt_encoder.load_state_dict(self.src_encoder.state_dict())
+                self.is_pretrained = True
+                # 关键：让 AdaTime 框架在推理 / 保存 checkpoint 时用 tgt_encoder
+                self.feature_extractor = self.tgt_encoder
+                self.network = nn.Sequential(self.tgt_encoder, self.classifier)
+
+            self._adapt_epoch(src_loader, trg_loader, avg_meter, epoch)
+
+    # ===================================================================
+    # 阶段 1：源域监督预训练
+    # ===================================================================
+    def _pretrain_epoch(self, src_loader, avg_meter):
+        self.src_encoder.train()
+        self.classifier.train()
+
+        for src_x, src_y in src_loader:
+            src_x, src_y = src_x.to(self.device), src_y.to(self.device)
+
+            src_feat = self.src_encoder(src_x)
+            src_pred = self.classifier(src_feat)
+            loss = self.cls_criterion(src_pred, src_y)
+
+            self.src_optimizer.zero_grad()
+            loss.backward()
+            self.src_optimizer.step()
+
+            avg_meter['Src_cls_loss'].update(loss.item(), src_x.size(0))
+
+    # ===================================================================
+    # 阶段 2：对抗自适应
+    # ===================================================================
+    def _adapt_epoch(self, src_loader, trg_loader, avg_meter, epoch):
+        # 冻结源 encoder 和 classifier
+        self.src_encoder.eval()
+        self.classifier.eval()
+
+        joint_loader = enumerate(zip(src_loader, itertools.cycle(trg_loader)))
+
+        for step, ((src_x, src_y), (trg_x, _)) in joint_loader:
+            src_x, src_y, trg_x = (src_x.to(self.device),
+                                   src_y.to(self.device),
+                                   trg_x.to(self.device))
+
+            self.tgt_encoder.train()
+            self.discriminator.train()
+
+            bs_src = src_x.size(0)
+            bs_trg = trg_x.size(0)
+
+            # -------- (a) 训练 discriminator --------
+            with torch.no_grad():
+                src_feat = self.src_encoder(src_x).flatten(1)
+                tgt_feat_d = self.tgt_encoder(trg_x).flatten(1)
+
+            feat_concat = torch.cat([src_feat, tgt_feat_d], dim=0)
+            pred_concat = self.discriminator(feat_concat)
+
+            label_src = torch.ones(bs_src,  dtype=torch.long, device=self.device)
+            label_tgt = torch.zeros(bs_trg, dtype=torch.long, device=self.device)
+            label_concat = torch.cat([label_src, label_tgt], dim=0)
+
+            d_loss = self.adv_criterion(pred_concat, label_concat)
+
+            self.disc_optimizer.zero_grad()
+            d_loss.backward()
+            self.disc_optimizer.step()
+
+            d_acc = (pred_concat.argmax(1) == label_concat).float().mean().item()
+
+            # -------- (b) 训练 target encoder (骗过 D) --------
+            tgt_feat = self.tgt_encoder(trg_x).flatten(1)
+            pred_tgt = self.discriminator(tgt_feat)
+            # 翻转标签：希望 D 把 target 判为 source(1)
+            label_flip = torch.ones(bs_trg, dtype=torch.long, device=self.device)
+            g_loss = self.adv_criterion(pred_tgt, label_flip)
+
+            self.tgt_optimizer.zero_grad()
+            g_loss.backward()
+            self.tgt_optimizer.step()
+
+            # -------- (c) 监控用：源域分类 loss（不反传）--------
+            with torch.no_grad():
+                src_pred = self.classifier(self.src_encoder(src_x))
+                src_cls_loss_val = self.cls_criterion(src_pred, src_y).item()
+
+            losses = {
+                'Src_cls_loss': src_cls_loss_val,   # 为了 best_model 选择机制
+                'Disc_loss':    d_loss.item(),
+                'Gen_loss':     g_loss.item(),
+                'Disc_acc':     d_acc,
+            }
+            for key, val in losses.items():
+                avg_meter[key].update(val, 32)
