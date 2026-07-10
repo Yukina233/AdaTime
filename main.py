@@ -18,19 +18,31 @@ if __name__ == "__main__":
     parser.add_argument('--exp_name', default=f'{get_time()}', type=str, help='experiment name')
 
     # ========= Select the DA methods ============0.6
-    parser.add_argument('--da_method', default='DANN', type=str,
-                        help='NO_ADAPT, Deep_Coral, MMDA, DANN, CDAN, DIRT, DSAN, HoMM, CoDATS, AdvSKM, SASA, CoTMix, TARGET_ONLY')
+    parser.add_argument('--da_method', default='ADDA', type=str,
+                        help='NO_ADAPT, Deep_Coral, MMDA, DANN, CDAN, DIRT, DSAN, HoMM, CoDATS, AdvSKM, SASA, CoTMix, ADDA, TARGET_ONLY')
 
     # ========= Select the DATASET ==============
     parser.add_argument('--data_path', default=r'../ADATIME_data', type=str, help='Path containing datase2t')
-    parser.add_argument('--dataset', default='HAR', type=str, help='Dataset of choice: (WISDM - EEG - HAR - HHAR_SA)')
+    parser.add_argument('--dataset', default='HHAR', type=str, help='Dataset of choice: (WISDM - EEG - HAR - HHAR_SA)')
 
     # ========= Select the BACKBONE ==============
     parser.add_argument('--backbone', default='CNN', type=str, help='Backbone of choice: (CNN - RESNET18 - TCN)')
 
     # ========= Experiment settings ===============
-    parser.add_argument('--num_runs', default=5, type=int, help='Number of consecutive run with different seeds')
+    parser.add_argument('--num_runs', default=1, type=int, help='Number of consecutive run with different seeds')
     parser.add_argument('--device', default="cuda", type=str, help='cpu or cuda')
+
+    # ========= Latent-space visualization =========
+    parser.add_argument('--visualize_mds', default='true',
+                        help='Save MDS latent-space plots with domain markers and class colors')
+    parser.add_argument('--mds_max_samples', default=1000, type=int,
+                        help='Maximum samples per domain used in each MDS plot')
+    parser.add_argument('--mds_split', default='test', type=str, choices=['train', 'test'],
+                        help='Data split used for MDS visualization')
+    parser.add_argument('--mds_model', default='last', type=str, choices=['last', 'best', 'both'],
+                        help='Checkpoint state visualized by MDS')
+    parser.add_argument('--mds_random_state', default=0, type=int,
+                        help='Random seed for balanced MDS sampling and projection')
 
     # arguments
     args = parser.parse_args()
@@ -41,8 +53,8 @@ if __name__ == "__main__":
     # train and test
     if args.phase == 'train':
         trainer.fit()
-    # elif args.phase == 'test':
-    #     trainer.test()
+        trainer.test_with_source_and_target()
+    elif args.phase == 'test':
         trainer.test_with_source_and_target()
 # TODO:
 # 1- Change the naming of the functions ---> ( Done)

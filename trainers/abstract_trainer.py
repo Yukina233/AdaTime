@@ -64,6 +64,17 @@ class AbstractTrainer(object):
         # Specify runs
         self.num_runs = args.num_runs
 
+        # Latent-space visualization settings
+        visualize_mds = getattr(args, "visualize_mds", False)
+        if isinstance(visualize_mds, str):
+            visualize_mds = visualize_mds.lower() in ("1", "true", "yes", "y")
+        self.visualize_mds = visualize_mds
+        self.mds_max_samples = getattr(args, "mds_max_samples", 1000)
+        self.mds_split = getattr(args, "mds_split", "test")
+        self.mds_model = getattr(args, "mds_model", "last")
+        self.mds_random_state = getattr(args, "mds_random_state", 0)
+        self._loaded_checkpoint = None
+
         # get dataset and base model configs
         self.dataset_configs, self.hparams_class = self.get_configs()
 
@@ -97,10 +108,28 @@ class AbstractTrainer(object):
         self.algorithm.to(self.device)
 
     def load_checkpoint(self, model_dir):
-        checkpoint = torch.load(os.path.join(self.home_path, model_dir, 'checkpoint.pt'))
+        checkpoint = torch.load(os.path.join(self.home_path, model_dir, 'checkpoint.pt'), map_location=self.device)
+        self._loaded_checkpoint = checkpoint
         last_model = checkpoint['last']
         best_model = checkpoint['best']
         return last_model, best_model
+
+    def load_model_state(self, model_state, checkpoint_name=None):
+        visual_state = self._get_visualization_checkpoint_state(checkpoint_name)
+        if visual_state is not None and hasattr(self.algorithm, "load_visualization_state"):
+            self.algorithm.load_visualization_state(visual_state)
+        else:
+            self.algorithm.network.load_state_dict(model_state)
+
+    def _get_visualization_checkpoint_state(self, checkpoint_name):
+        if checkpoint_name is None or not isinstance(self._loaded_checkpoint, dict):
+            return None
+
+        visualization_state = self._loaded_checkpoint.get("visualization")
+        if not isinstance(visualization_state, dict):
+            return None
+
+        return visualization_state.get(checkpoint_name)
 
     def train_model(self):
         # Get the algorithm and the backbone network
@@ -198,6 +227,8 @@ class AbstractTrainer(object):
             "last": last_model,
             "best": best_model
         }
+        if hasattr(self, "algorithm") and hasattr(self.algorithm, "get_visualization_checkpoint"):
+            save_dict["visualization"] = self.algorithm.get_visualization_checkpoint()
         # save classification report
         save_path = os.path.join(home_path, log_dir, f"checkpoint.pt")
         torch.save(save_dict, save_path)
@@ -310,3 +341,215 @@ class AbstractTrainer(object):
         # auroc
         auroc = self.AUROC(self.full_preds.cpu(), self.full_labels.cpu()).item()
         return acc, f1, auroc
+
+    def should_visualize_mds_checkpoint(self, checkpoint_name):
+        if not self.visualize_mds:
+            return False
+        return self.mds_model == "both" or self.mds_model == checkpoint_name
+
+    def save_mds_visualization(self, scenario, run_id, checkpoint_name):
+        if not self.should_visualize_mds_checkpoint(checkpoint_name):
+            return
+
+        try:
+            src_loader, trg_loader = self._get_mds_loaders()
+            src_encoder, trg_encoder = self._get_mds_encoders()
+
+            src_features, src_labels, src_preds = self._extract_mds_features(src_loader, src_encoder)
+            trg_features, trg_labels, trg_preds = self._extract_mds_features(trg_loader, trg_encoder)
+
+            max_per_domain = max(1, int(self.hparams.get("vis_max_samples_per_domain", self.mds_max_samples)))
+            src_idx = self._balanced_sample_indices(src_labels, max_per_domain)
+            trg_idx = self._balanced_sample_indices(trg_labels, max_per_domain)
+
+            src_features = src_features[src_idx]
+            src_labels = src_labels[src_idx]
+            src_preds = src_preds[src_idx]
+            trg_features = trg_features[trg_idx]
+            trg_labels = trg_labels[trg_idx]
+            trg_preds = trg_preds[trg_idx]
+
+            features = np.concatenate([src_features, trg_features], axis=0)
+            labels = np.concatenate([src_labels, trg_labels], axis=0).astype(int)
+            preds = np.concatenate([src_preds, trg_preds], axis=0).astype(int)
+            domains = np.asarray(["Source"] * len(src_features) + ["Target"] * len(trg_features))
+
+            if len(features) < 5:
+                self._log_visualization_message(f"[vis] skipped: too few samples ({len(features)})")
+                return
+
+            coords = self._compute_mds_coordinates(features)
+            output_dir = os.path.join(self._scenario_output_dir(), "visualizations")
+            os.makedirs(output_dir, exist_ok=True)
+
+            src_id, trg_id = self._split_scenario_name(scenario)
+            checkpoint_suffix = f"_{checkpoint_name}" if self.mds_model == "both" else ""
+            base_name = f"{self.da_method}_{src_id}_to_{trg_id}_run_{run_id}{checkpoint_suffix}_latent_mds"
+            csv_path = os.path.join(output_dir, f"{base_name}.csv")
+            fig_path = os.path.join(output_dir, f"{base_name}.png")
+
+            self._plot_mds_coordinates(coords, domains, labels, scenario, run_id, checkpoint_name, fig_path)
+            pd.DataFrame({
+                "mds_1": coords[:, 0],
+                "mds_2": coords[:, 1],
+                "domain": domains,
+                "label": labels,
+                "pred": preds,
+            }).to_csv(csv_path, index=False)
+
+            self._log_visualization_message(f"[vis] saved latent MDS to {fig_path}")
+        except Exception as exc:
+            self._log_visualization_message(f"[vis] failed {scenario} run {run_id} {checkpoint_name}: {exc}")
+
+    def _get_mds_loaders(self):
+        if self.mds_split == "train":
+            return self.src_train_dl, self.trg_train_dl
+        return self.src_test_dl, self.trg_test_dl
+
+    def _get_mds_encoders(self):
+        if hasattr(self.algorithm, "visualization_encoders"):
+            return self.algorithm.visualization_encoders()
+        return self.algorithm.feature_extractor, self.algorithm.feature_extractor
+
+    def _extract_mds_features(self, loader, encoder):
+        encoder = encoder.to(self.device)
+        classifier = self.algorithm.classifier.to(self.device)
+        encoder.eval()
+        classifier.eval()
+
+        features_list, labels_list, preds_list = [], [], []
+        with torch.no_grad():
+            for data, labels in loader:
+                data = data.float().to(self.device)
+                features = encoder(data).flatten(1)
+                logits = classifier(features)
+                preds = logits.argmax(dim=1).detach().cpu()
+
+                if labels is None:
+                    labels = torch.full((data.size(0),), -1, dtype=torch.long)
+                else:
+                    labels = labels.view((-1)).long().cpu()
+
+                features_list.append(features.detach().cpu())
+                labels_list.append(labels)
+                preds_list.append(preds)
+
+        features = torch.cat(features_list, dim=0).numpy()
+        labels = torch.cat(labels_list, dim=0).numpy()
+        preds = torch.cat(preds_list, dim=0).numpy()
+        return features, labels, preds
+
+    def _balanced_sample_indices(self, labels, max_count):
+        if max_count <= 0 or len(labels) <= max_count:
+            return np.arange(len(labels))
+
+        rng = np.random.default_rng(self.mds_random_state)
+        selected = []
+        classes = np.unique(labels)
+        per_class = max(1, max_count // max(1, len(classes)))
+
+        for label in classes:
+            class_indices = np.flatnonzero(labels == label)
+            take = min(per_class, len(class_indices))
+            if take > 0:
+                selected.extend(rng.choice(class_indices, size=take, replace=False).tolist())
+
+        if len(selected) < max_count:
+            selected_arr = np.asarray(selected, dtype=int)
+            remaining = np.setdiff1d(np.arange(len(labels)), selected_arr, assume_unique=False)
+            fill_count = min(max_count - len(selected), len(remaining))
+            if fill_count > 0:
+                selected.extend(rng.choice(remaining, size=fill_count, replace=False).tolist())
+
+        selected = np.asarray(selected[:max_count], dtype=int)
+        rng.shuffle(selected)
+        return selected
+
+    def _compute_mds_coordinates(self, features):
+        from sklearn.manifold import MDS
+        from sklearn.preprocessing import StandardScaler
+
+        features = StandardScaler().fit_transform(features)
+        mds = MDS(n_components=2,
+                  random_state=int(self.hparams.get("vis_mds_seed", self.mds_random_state)),
+                  max_iter=int(self.hparams.get("vis_mds_max_iter", 300)),
+                  n_init=int(self.hparams.get("vis_mds_n_init", 4)),
+                  dissimilarity="euclidean")
+        return mds.fit_transform(features)
+
+    def _plot_mds_coordinates(self, coords, domains, labels, scenario, run_id, checkpoint_name, fig_path):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.lines import Line2D
+
+        src_id, trg_id = self._split_scenario_name(scenario)
+        cmap = plt.get_cmap("tab10", self.num_classes) if self.num_classes <= 10 else plt.get_cmap("tab20", self.num_classes)
+        colors = [cmap(i) for i in range(self.num_classes)]
+        markers = {"Source": "o", "Target": "x"}
+        sizes = {"Source": 24, "Target": 42}
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        for domain in ("Source", "Target"):
+            for cls in range(self.num_classes):
+                mask = (domains == domain) & (labels == cls)
+                if not np.any(mask):
+                    continue
+                ax.scatter(
+                    coords[mask, 0],
+                    coords[mask, 1],
+                    c=[colors[cls]],
+                    marker=markers[domain],
+                    s=sizes[domain],
+                    linewidths=1.2 if domain == "Target" else 0.35,
+                    edgecolors="black" if domain == "Source" else None,
+                    alpha=0.78 if domain == "Source" else 0.9,
+                )
+
+        class_handles = []
+        for cls in range(self.num_classes):
+            class_handles.append(
+                Line2D([0], [0], marker="o", linestyle="", markerfacecolor=colors[cls],
+                       markeredgecolor="black", markersize=8, label=self._label_to_class_name(cls))
+            )
+        domain_handles = [
+            Line2D([0], [0], marker="o", linestyle="", markerfacecolor="gray",
+                   markeredgecolor="black", markersize=8, label="Source"),
+            Line2D([0], [0], marker="x", linestyle="", markeredgecolor="gray",
+                   markeredgewidth=1.8, markersize=9, label="Target"),
+        ]
+
+        leg1 = ax.legend(handles=class_handles, title="Class", loc="upper right", framealpha=0.92)
+        ax.add_artist(leg1)
+        ax.legend(handles=domain_handles, title="Domain", loc="lower right", framealpha=0.92)
+        title_suffix = f", {checkpoint_name}" if self.mds_model == "both" else ""
+        ax.set_title(f"{self.da_method}: latent MDS ({src_id} to {trg_id}, run {run_id}{title_suffix})")
+        ax.set_xlabel("MDS 1")
+        ax.set_ylabel("MDS 2")
+        ax.grid(alpha=0.25)
+        fig.tight_layout()
+        fig.savefig(fig_path, dpi=330, bbox_inches="tight")
+        plt.close(fig)
+
+    def _label_to_class_name(self, label):
+        class_names = getattr(self.dataset_configs, "class_names", None)
+        label = int(label)
+        if class_names is not None and 0 <= label < len(class_names):
+            return class_names[label]
+        return f"class {label}"
+
+    def _scenario_output_dir(self):
+        if os.path.isabs(self.scenario_log_dir):
+            return self.scenario_log_dir
+        return os.path.join(self.home_path, self.scenario_log_dir)
+
+    def _split_scenario_name(self, scenario):
+        if "_to_" in scenario:
+            return tuple(scenario.split("_to_", 1))
+        return scenario, "target"
+
+    def _log_visualization_message(self, msg):
+        if hasattr(self, "logger") and self.logger is not None:
+            self.logger.debug(msg)
+        print(msg)
+

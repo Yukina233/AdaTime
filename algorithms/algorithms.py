@@ -1645,6 +1645,63 @@ class ADDA(Algorithm):
         self.pretrain_epochs = hparams["pretrain_epochs"]
         self.current_epoch = 0
         self.is_pretrained = False
+        self.last_visual_state = None
+        self.best_visual_state = None
+
+    def update(self, src_loader, trg_loader, avg_meter, logger):
+        best_src_risk = float('inf')
+        best_model = None
+        self.best_visual_state = None
+
+        for epoch in range(1, self.hparams["num_epochs"] + 1):
+            self.current_epoch = epoch - 1
+            self.training_epoch(src_loader, trg_loader, avg_meter, epoch)
+
+            if (epoch + 1) % 10 == 0 and avg_meter['Src_cls_loss'].avg < best_src_risk:
+                best_src_risk = avg_meter['Src_cls_loss'].avg
+                best_model = deepcopy(self.network.state_dict())
+                self.best_visual_state = self._snapshot_visualization_state()
+
+            logger.debug(f'[Epoch : {epoch}/{self.hparams["num_epochs"]}]')
+            for key, val in avg_meter.items():
+                logger.debug(f'{key}\t: {val.avg:2.4f}')
+            logger.debug(f'-------------------------------------')
+
+        last_model = self.network.state_dict()
+        self.last_visual_state = self._snapshot_visualization_state()
+        return last_model, best_model
+
+    def _snapshot_visualization_state(self):
+        return {
+            "src_encoder": deepcopy(self.src_encoder.state_dict()),
+            "tgt_encoder": deepcopy(self.tgt_encoder.state_dict()),
+            "classifier": deepcopy(self.classifier.state_dict()),
+            "is_pretrained": self.is_pretrained,
+        }
+
+    def get_visualization_checkpoint(self):
+        return {
+            "last": self.last_visual_state or self._snapshot_visualization_state(),
+            "best": self.best_visual_state,
+        }
+
+    def load_visualization_state(self, state):
+        self.src_encoder.load_state_dict(state["src_encoder"])
+        self.tgt_encoder.load_state_dict(state["tgt_encoder"])
+        self.classifier.load_state_dict(state["classifier"])
+        self.is_pretrained = bool(state.get("is_pretrained", True))
+
+        if self.is_pretrained:
+            self.feature_extractor = self.tgt_encoder
+            self.network = nn.Sequential(self.tgt_encoder, self.classifier)
+        else:
+            self.feature_extractor = self.src_encoder
+            self.network = nn.Sequential(self.src_encoder, self.classifier)
+
+    def visualization_encoders(self):
+        if self.is_pretrained:
+            return self.src_encoder, self.tgt_encoder
+        return self.src_encoder, self.src_encoder
 
     # ===================================================================
     # AdaTime 的入口：按 epoch 调用

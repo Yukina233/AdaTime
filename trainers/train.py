@@ -128,20 +128,22 @@ class Trainer(AbstractTrainer):
                 last_chk, best_chk = self.load_checkpoint(self.scenario_log_dir)
 
                 # Testing the last model
-                self.algorithm.network.load_state_dict(last_chk)
+                self.load_model_state(last_chk, "last")
                 self.evaluate(self.trg_test_dl)
                 last_metrics = self.calculate_metrics()
                 last_results = self.append_results_to_tables(last_results, f"{src_id}_to_{trg_id}", run_id,
                                                              last_metrics)
+                self.save_mds_visualization(f"{src_id}_to_{trg_id}", run_id, "last")
                 
 
                 # Testing the best model
-                self.algorithm.network.load_state_dict(best_chk)
+                self.load_model_state(best_chk, "best")
                 self.evaluate(self.trg_test_dl)
                 best_metrics = self.calculate_metrics()
                 # Append results to tables
                 best_results = self.append_results_to_tables(best_results, f"{src_id}_to_{trg_id}", run_id,
                                                              best_metrics)
+                self.save_mds_visualization(f"{src_id}_to_{trg_id}", run_id, "best")
 
         last_scenario_mean_std = last_results.groupby('scenario')[['acc', 'f1_score', 'auroc']].agg(['mean', 'std'])
         insert_mean_std(last_scenario_mean_std)
@@ -194,22 +196,24 @@ class Trainer(AbstractTrainer):
                 scenario = f"{src_id}_to_{trg_id}"
 
                 # ---------------- Testing the last model ----------------
-                self.algorithm.network.load_state_dict(last_chk)
+                self.load_model_state(last_chk, "last")
                 # target domain
                 last_metrics = self.calculate_metrics_for_loader(self.trg_test_dl)
                 last_results = self.append_results_to_tables(last_results, scenario, run_id, last_metrics)
                 # source domain
                 last_src_metrics = self.calculate_metrics_for_loader(self.src_test_dl)
                 last_src_results = self.append_results_to_tables(last_src_results, scenario, run_id, last_src_metrics)
+                self.save_mds_visualization(scenario, run_id, "last")
 
                 # ---------------- Testing the best model ----------------
-                self.algorithm.network.load_state_dict(best_chk)
+                self.load_model_state(best_chk, "best")
                 # target domain
                 best_metrics = self.calculate_metrics_for_loader(self.trg_test_dl)
                 best_results = self.append_results_to_tables(best_results, scenario, run_id, best_metrics)
                 # source domain
                 best_src_metrics = self.calculate_metrics_for_loader(self.src_test_dl)
                 best_src_results = self.append_results_to_tables(best_src_results, scenario, run_id, best_src_metrics)
+                self.save_mds_visualization(scenario, run_id, "best")
 
         # ---------------- Aggregate: target domain ----------------
         last_scenario_mean_std = last_results.groupby('scenario')[['acc', 'f1_score', 'auroc']].agg(['mean', 'std'])
