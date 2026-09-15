@@ -133,7 +133,7 @@ class Trainer(AbstractTrainer):
                 last_metrics = self.calculate_metrics()
                 last_results = self.append_results_to_tables(last_results, f"{src_id}_to_{trg_id}", run_id,
                                                              last_metrics)
-                self.save_mds_visualization(f"{src_id}_to_{trg_id}", run_id, "last")
+                self.save_latent_visualizations(f"{src_id}_to_{trg_id}", run_id, "last")
                 
 
                 # Testing the best model
@@ -143,7 +143,7 @@ class Trainer(AbstractTrainer):
                 # Append results to tables
                 best_results = self.append_results_to_tables(best_results, f"{src_id}_to_{trg_id}", run_id,
                                                              best_metrics)
-                self.save_mds_visualization(f"{src_id}_to_{trg_id}", run_id, "best")
+                self.save_latent_visualizations(f"{src_id}_to_{trg_id}", run_id, "best")
 
         last_scenario_mean_std = last_results.groupby('scenario')[['acc', 'f1_score', 'auroc']].agg(['mean', 'std'])
         insert_mean_std(last_scenario_mean_std)
@@ -203,7 +203,7 @@ class Trainer(AbstractTrainer):
                 # source domain
                 last_src_metrics = self.calculate_metrics_for_loader(self.src_test_dl)
                 last_src_results = self.append_results_to_tables(last_src_results, scenario, run_id, last_src_metrics)
-                self.save_mds_visualization(scenario, run_id, "last")
+                self.save_latent_visualizations(scenario, run_id, "last")
 
                 # ---------------- Testing the best model ----------------
                 self.load_model_state(best_chk, "best")
@@ -213,7 +213,7 @@ class Trainer(AbstractTrainer):
                 # source domain
                 best_src_metrics = self.calculate_metrics_for_loader(self.src_test_dl)
                 best_src_results = self.append_results_to_tables(best_src_results, scenario, run_id, best_src_metrics)
-                self.save_mds_visualization(scenario, run_id, "best")
+                self.save_latent_visualizations(scenario, run_id, "best")
 
         # ---------------- Aggregate: target domain ----------------
         last_scenario_mean_std = last_results.groupby('scenario')[['acc', 'f1_score', 'auroc']].agg(['mean', 'std'])
@@ -254,5 +254,4 @@ class Trainer(AbstractTrainer):
         for summary_name, summary in [('Last', summary_last_src), ('Best', summary_best_src)]:
             for key, val in summary.items():
                 print(f'{summary_name}: {key}\t: {val:2.4f}')
-
 

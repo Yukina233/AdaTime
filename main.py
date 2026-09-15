@@ -18,7 +18,7 @@ if __name__ == "__main__":
     parser.add_argument('--exp_name', default=f'{get_time()}', type=str, help='experiment name')
 
     # ========= Select the DA methods ============0.6
-    parser.add_argument('--da_method', default='ADDA', type=str,
+    parser.add_argument('--da_method', default='DANN', type=str,
                         help='NO_ADAPT, Deep_Coral, MMDA, DANN, CDAN, DIRT, DSAN, HoMM, CoDATS, AdvSKM, SASA, CoTMix, ADDA, TARGET_ONLY')
 
     # ========= Select the DATASET ==============
@@ -43,6 +43,12 @@ if __name__ == "__main__":
                         help='Checkpoint state visualized by MDS')
     parser.add_argument('--mds_random_state', default=0, type=int,
                         help='Random seed for balanced MDS sampling and projection')
+    parser.add_argument('--visualize_pca_boundary', default=None, choices=['true', 'false'],
+                        help='Save PCA decision-boundary plots; defaults to --visualize_mds')
+    parser.add_argument('--pca_boundary_grid_size', default=250, type=int,
+                        help='Grid resolution for PCA decision-boundary plots')
+    parser.add_argument('--pca_boundary_padding', default=0.6, type=float,
+                        help='Padding around PCA scatter limits when drawing decision regions')
 
     # arguments
     args = parser.parse_args()

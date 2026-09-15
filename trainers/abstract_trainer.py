@@ -69,10 +69,18 @@ class AbstractTrainer(object):
         if isinstance(visualize_mds, str):
             visualize_mds = visualize_mds.lower() in ("1", "true", "yes", "y")
         self.visualize_mds = visualize_mds
+        visualize_pca_boundary = getattr(args, "visualize_pca_boundary", None)
+        if visualize_pca_boundary is None:
+            visualize_pca_boundary = self.visualize_mds
+        elif isinstance(visualize_pca_boundary, str):
+            visualize_pca_boundary = visualize_pca_boundary.lower() in ("1", "true", "yes", "y")
+        self.visualize_pca_boundary = visualize_pca_boundary
         self.mds_max_samples = getattr(args, "mds_max_samples", 1000)
         self.mds_split = getattr(args, "mds_split", "test")
         self.mds_model = getattr(args, "mds_model", "last")
         self.mds_random_state = getattr(args, "mds_random_state", 0)
+        self.pca_boundary_grid_size = getattr(args, "pca_boundary_grid_size", 250)
+        self.pca_boundary_padding = getattr(args, "pca_boundary_padding", 0.6)
         self._loaded_checkpoint = None
 
         # get dataset and base model configs
@@ -347,37 +355,34 @@ class AbstractTrainer(object):
             return False
         return self.mds_model == "both" or self.mds_model == checkpoint_name
 
-    def save_mds_visualization(self, scenario, run_id, checkpoint_name):
+    def should_visualize_pca_boundary_checkpoint(self, checkpoint_name):
+        if not self.visualize_pca_boundary:
+            return False
+        return self.mds_model == "both" or self.mds_model == checkpoint_name
+
+    def save_latent_visualizations(self, scenario, run_id, checkpoint_name):
+        data = None
+        if self.should_visualize_mds_checkpoint(checkpoint_name) or \
+                self.should_visualize_pca_boundary_checkpoint(checkpoint_name):
+            data = self._collect_latent_visualization_data(scenario, run_id, checkpoint_name)
+
+        self.save_mds_visualization(scenario, run_id, checkpoint_name, data)
+        self.save_pca_decision_boundary_visualization(scenario, run_id, checkpoint_name, data)
+
+    def save_mds_visualization(self, scenario, run_id, checkpoint_name, data=None):
         if not self.should_visualize_mds_checkpoint(checkpoint_name):
             return
 
         try:
-            src_loader, trg_loader = self._get_mds_loaders()
-            src_encoder, trg_encoder = self._get_mds_encoders()
-
-            src_features, src_labels, src_preds = self._extract_mds_features(src_loader, src_encoder)
-            trg_features, trg_labels, trg_preds = self._extract_mds_features(trg_loader, trg_encoder)
-
-            max_per_domain = max(1, int(self.hparams.get("vis_max_samples_per_domain", self.mds_max_samples)))
-            src_idx = self._balanced_sample_indices(src_labels, max_per_domain)
-            trg_idx = self._balanced_sample_indices(trg_labels, max_per_domain)
-
-            src_features = src_features[src_idx]
-            src_labels = src_labels[src_idx]
-            src_preds = src_preds[src_idx]
-            trg_features = trg_features[trg_idx]
-            trg_labels = trg_labels[trg_idx]
-            trg_preds = trg_preds[trg_idx]
-
-            features = np.concatenate([src_features, trg_features], axis=0)
-            labels = np.concatenate([src_labels, trg_labels], axis=0).astype(int)
-            preds = np.concatenate([src_preds, trg_preds], axis=0).astype(int)
-            domains = np.asarray(["Source"] * len(src_features) + ["Target"] * len(trg_features))
-
-            if len(features) < 5:
-                self._log_visualization_message(f"[vis] skipped: too few samples ({len(features)})")
+            if data is None:
+                data = self._collect_latent_visualization_data(scenario, run_id, checkpoint_name)
+            if data is None:
                 return
 
+            features = data["features"]
+            labels = data["labels"]
+            preds = data["preds"]
+            domains = data["domains"]
             coords = self._compute_mds_coordinates(features)
             output_dir = os.path.join(self._scenario_output_dir(), "visualizations")
             os.makedirs(output_dir, exist_ok=True)
@@ -400,6 +405,83 @@ class AbstractTrainer(object):
             self._log_visualization_message(f"[vis] saved latent MDS to {fig_path}")
         except Exception as exc:
             self._log_visualization_message(f"[vis] failed {scenario} run {run_id} {checkpoint_name}: {exc}")
+
+    def save_pca_decision_boundary_visualization(self, scenario, run_id, checkpoint_name, data=None):
+        if not self.should_visualize_pca_boundary_checkpoint(checkpoint_name):
+            return
+
+        try:
+            if data is None:
+                data = self._collect_latent_visualization_data(scenario, run_id, checkpoint_name)
+            if data is None:
+                return
+
+            features = data["features"]
+            labels = data["labels"]
+            preds = data["preds"]
+            domains = data["domains"]
+
+            coords, grid_x, grid_y, grid_pred = self._compute_pca_decision_boundary(features)
+            output_dir = os.path.join(self._scenario_output_dir(), "visualizations")
+            os.makedirs(output_dir, exist_ok=True)
+
+            src_id, trg_id = self._split_scenario_name(scenario)
+            checkpoint_suffix = f"_{checkpoint_name}" if self.mds_model == "both" else ""
+            base_name = f"{self.da_method}_{src_id}_to_{trg_id}_run_{run_id}{checkpoint_suffix}_pca_decision_boundary"
+            csv_path = os.path.join(output_dir, f"{base_name}.csv")
+            fig_path = os.path.join(output_dir, f"{base_name}.png")
+
+            self._plot_pca_decision_boundary(coords, domains, labels, grid_x, grid_y, grid_pred,
+                                             scenario, run_id, checkpoint_name, fig_path)
+            pd.DataFrame({
+                "pca_1": coords[:, 0],
+                "pca_2": coords[:, 1],
+                "domain": domains,
+                "label": labels,
+                "pred": preds,
+            }).to_csv(csv_path, index=False)
+
+            self._log_visualization_message(f"[vis] saved PCA decision boundary to {fig_path}")
+        except Exception as exc:
+            self._log_visualization_message(
+                f"[vis] failed PCA decision boundary {scenario} run {run_id} {checkpoint_name}: {exc}"
+            )
+
+    def _collect_latent_visualization_data(self, scenario, run_id, checkpoint_name):
+        src_loader, trg_loader = self._get_mds_loaders()
+        src_encoder, trg_encoder = self._get_mds_encoders()
+
+        src_features, src_labels, src_preds = self._extract_mds_features(src_loader, src_encoder)
+        trg_features, trg_labels, trg_preds = self._extract_mds_features(trg_loader, trg_encoder)
+
+        max_per_domain = max(1, int(self.hparams.get("vis_max_samples_per_domain", self.mds_max_samples)))
+        src_idx = self._balanced_sample_indices(src_labels, max_per_domain)
+        trg_idx = self._balanced_sample_indices(trg_labels, max_per_domain)
+
+        src_features = src_features[src_idx]
+        src_labels = src_labels[src_idx]
+        src_preds = src_preds[src_idx]
+        trg_features = trg_features[trg_idx]
+        trg_labels = trg_labels[trg_idx]
+        trg_preds = trg_preds[trg_idx]
+
+        features = np.concatenate([src_features, trg_features], axis=0)
+        labels = np.concatenate([src_labels, trg_labels], axis=0).astype(int)
+        preds = np.concatenate([src_preds, trg_preds], axis=0).astype(int)
+        domains = np.asarray(["Source"] * len(src_features) + ["Target"] * len(trg_features))
+
+        if len(features) < 5:
+            self._log_visualization_message(
+                f"[vis] skipped {scenario} run {run_id} {checkpoint_name}: too few samples ({len(features)})"
+            )
+            return None
+
+        return {
+            "features": features,
+            "labels": labels,
+            "preds": preds,
+            "domains": domains,
+        }
 
     def _get_mds_loaders(self):
         if self.mds_split == "train":
@@ -477,6 +559,47 @@ class AbstractTrainer(object):
                   dissimilarity="euclidean")
         return mds.fit_transform(features)
 
+    def _compute_pca_decision_boundary(self, features):
+        from sklearn.decomposition import PCA
+        from sklearn.preprocessing import StandardScaler
+
+        if features.shape[1] < 2:
+            raise ValueError("PCA decision boundary requires at least 2 latent feature dimensions")
+
+        scaler = StandardScaler()
+        features_std = scaler.fit_transform(features)
+        pca = PCA(n_components=2)
+        coords = pca.fit_transform(features_std)
+
+        padding = float(self.hparams.get("vis_pca_padding", self.pca_boundary_padding))
+        x_min, x_max = coords[:, 0].min() - padding, coords[:, 0].max() + padding
+        y_min, y_max = coords[:, 1].min() - padding, coords[:, 1].max() + padding
+
+        grid_size = int(self.hparams.get("vis_pca_grid_size", self.pca_boundary_grid_size))
+        grid_size = max(50, grid_size)
+        grid_x, grid_y = np.meshgrid(
+            np.linspace(x_min, x_max, grid_size),
+            np.linspace(y_min, y_max, grid_size)
+        )
+
+        grid_2d = np.c_[grid_x.ravel(), grid_y.ravel()]
+        grid_features_std = pca.inverse_transform(grid_2d)
+        grid_features = scaler.inverse_transform(grid_features_std).astype(np.float32)
+        grid_pred = self._predict_latent_features(grid_features).reshape(grid_x.shape)
+        return coords, grid_x, grid_y, grid_pred
+
+    def _predict_latent_features(self, features, batch_size=4096):
+        classifier = self.algorithm.classifier.to(self.device)
+        classifier.eval()
+
+        preds = []
+        with torch.no_grad():
+            for start in range(0, len(features), batch_size):
+                batch = torch.from_numpy(features[start:start + batch_size]).float().to(self.device)
+                logits = classifier(batch)
+                preds.append(logits.argmax(dim=1).detach().cpu().numpy())
+        return np.concatenate(preds, axis=0)
+
     def _plot_mds_coordinates(self, coords, domains, labels, scenario, run_id, checkpoint_name, fig_path):
         import matplotlib
         matplotlib.use("Agg")
@@ -531,6 +654,68 @@ class AbstractTrainer(object):
         fig.savefig(fig_path, dpi=330, bbox_inches="tight")
         plt.close(fig)
 
+    def _plot_pca_decision_boundary(self, coords, domains, labels, grid_x, grid_y, grid_pred,
+                                    scenario, run_id, checkpoint_name, fig_path):
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import ListedColormap
+        from matplotlib.lines import Line2D
+
+        src_id, trg_id = self._split_scenario_name(scenario)
+        base_cmap = plt.get_cmap("tab10", self.num_classes) if self.num_classes <= 10 else plt.get_cmap("tab20", self.num_classes)
+        colors = [base_cmap(i) for i in range(self.num_classes)]
+        region_cmap = ListedColormap(colors)
+        markers = {"Source": "o", "Target": "x"}
+        sizes = {"Source": 24, "Target": 42}
+
+        fig, ax = plt.subplots(figsize=(6, 6))
+        levels = np.arange(self.num_classes + 1) - 0.5
+        ax.contourf(grid_x, grid_y, grid_pred, levels=levels, cmap=region_cmap, alpha=0.16)
+        if len(np.unique(grid_pred)) > 1:
+            ax.contour(grid_x, grid_y, grid_pred, levels=levels, colors="white", linewidths=0.35, alpha=0.55)
+
+        for domain in ("Source", "Target"):
+            for cls in range(self.num_classes):
+                mask = (domains == domain) & (labels == cls)
+                if not np.any(mask):
+                    continue
+                ax.scatter(
+                    coords[mask, 0],
+                    coords[mask, 1],
+                    c=[colors[cls]],
+                    marker=markers[domain],
+                    s=sizes[domain],
+                    linewidths=1.2 if domain == "Target" else 0.35,
+                    edgecolors="black" if domain == "Source" else None,
+                    alpha=0.78 if domain == "Source" else 0.9,
+                )
+
+        class_handles = []
+        for cls in range(self.num_classes):
+            class_handles.append(
+                Line2D([0], [0], marker="o", linestyle="", markerfacecolor=colors[cls],
+                       markeredgecolor="black", markersize=8, label=self._label_to_class_name(cls))
+            )
+        domain_handles = [
+            Line2D([0], [0], marker="o", linestyle="", markerfacecolor="gray",
+                   markeredgecolor="black", markersize=8, label="Source"),
+            Line2D([0], [0], marker="x", linestyle="", markeredgecolor="gray",
+                   markeredgewidth=1.8, markersize=9, label="Target"),
+        ]
+
+        leg1 = ax.legend(handles=class_handles, title="Class", loc="upper right", framealpha=0.92)
+        ax.add_artist(leg1)
+        ax.legend(handles=domain_handles, title="Domain", loc="lower right", framealpha=0.92)
+        title_suffix = f", {checkpoint_name}" if self.mds_model == "both" else ""
+        ax.set_title(f"{self.da_method}: PCA decision boundary ({src_id} to {trg_id}, run {run_id}{title_suffix})")
+        ax.set_xlabel("PCA 1")
+        ax.set_ylabel("PCA 2")
+        ax.grid(alpha=0.25)
+        fig.tight_layout()
+        fig.savefig(fig_path, dpi=330, bbox_inches="tight")
+        plt.close(fig)
+
     def _label_to_class_name(self, label):
         class_names = getattr(self.dataset_configs, "class_names", None)
         label = int(label)
@@ -552,4 +737,3 @@ class AbstractTrainer(object):
         if hasattr(self, "logger") and self.logger is not None:
             self.logger.debug(msg)
         print(msg)
-
